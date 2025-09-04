@@ -83,12 +83,79 @@ def _to_bytesio(uploaded_file) -> io.BytesIO:
     return io.BytesIO(data)
 
 
-def load_answers_df(model_bytes: io.BytesIO) -> pd.DataFrame:
-    """Lees het `antwoorden` tabblad uit het docentenbestand als DataFrame.
-    Vereist kolommen: vraag_id, sheet, cel, verwacht (verwacht mag leeg zijn → dan lezen we uit het model zelf).
+def _normalize_sheet_name(name: str) -> str:
+    """Normaliseer werkbladtitel: lowercased, zonder spaties/tekens, voor robuuste matching."""
+    if not isinstance(name, str):
+        return ""
+    return "".join(ch for ch in name.lower().strip() if ch.isalnum())
+
+
+def find_answers_sheet(model_bytes: io.BytesIO) -> Optional[str]:
+    """Zoek het 'antwoorden' tabblad case-insensitief, met een paar synoniemen.
+    Accepteert o.a. Antwoorden/ANTWOORDEN, Antwoord, Answers, Answer, AnswerKey, Model, Key.
+    Retourneert de exacte naam zoals die in het bestand staat, of None als niet gevonden.
     """
+    # Probeer eerst via openpyxl (snel)
     model_bytes.seek(0)
-    df = pd.read_excel(model_bytes, sheet_name="antwoorden")
+    names: List[str] = []
+    try:
+        wb = load_workbook(filename=model_bytes, data_only=True, read_only=True)
+        names = list(wb.sheetnames)
+    except Exception:
+        names = []
+
+    # Fallback via pandas.ExcelFile
+    if not names:
+        model_bytes.seek(0)
+        try:
+            xls = pd.ExcelFile(model_bytes, engine="openpyxl")
+            names = list(xls.sheet_names)
+        except Exception:
+            names = []
+
+    if not names:
+        return None
+
+    norm_map = {_normalize_sheet_name(n): n for n in names}
+    wanted_exact = [
+        "antwoorden", "antwoord", "answers", "answer", "answerkey", "model", "key",
+    ]
+
+    for w in wanted_exact:
+        if w in norm_map:
+            return norm_map[w]
+
+    # Substring match als laatste redmiddel
+    for k, v in norm_map.items():
+        if ("antwoord" in k) or ("answer" in k):
+            return v
+
+    return None
+
+
+def load_answers_df(model_bytes: io.BytesIO) -> pd.DataFrame:
+    """Lees het antwoorden-tabblad als DataFrame.
+    Robuust voor variaties in tabbladnaam en geeft duidelijke foutmelding met gevonden tabbladen.
+    Vereist kolommen: vraag_id, sheet, cel, verwacht (verwacht mag leeg zijn).
+    """
+    # Zoek het juiste tabblad (case-insensitief + synoniemen)
+    sheet = find_answers_sheet(model_bytes)
+    if not sheet:
+        # Haal lijst met bladen voor foutmelding
+        model_bytes.seek(0)
+        try:
+            wb = load_workbook(filename=model_bytes, data_only=True, read_only=True)
+            available = ", ".join(wb.sheetnames)
+        except Exception:
+            available = "onbekend"
+        raise ValueError(
+            "Tabblad 'antwoorden' niet gevonden. Hernoem het antwoordenblad naar 'antwoorden' (of 'Antwoorden'). "
+            f"Gevonden tabbladen: {available}"
+        )
+
+    # Lees het gevonden tabblad in pandas
+    model_bytes.seek(0)
+    df = pd.read_excel(model_bytes, sheet_name=sheet, engine="openpyxl")
 
     # Normaliseer kolomnamen
     df.columns = [str(c).strip().lower() for c in df.columns]
@@ -97,10 +164,10 @@ def load_answers_df(model_bytes: io.BytesIO) -> pd.DataFrame:
     missing = required - set(df.columns)
     if missing:
         raise ValueError(
-            f"Tabblad 'antwoorden' mist verplichte kolommen: {', '.join(sorted(missing))}"
+            f"Tabblad '{sheet}' mist verplichte kolommen: {', '.join(sorted(missing))}"
         )
 
-    # Zorg voor optionele kolommen met defaults
+    # Optionele kolommen + defaults
     if "type" not in df.columns:
         df["type"] = "auto"
     if "tolerance" not in df.columns:

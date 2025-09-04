@@ -1,727 +1,303 @@
 """
-Streamlit app: Excel-opdrachten automatisch nakijken (met feedback)
-------------------------------------------------------------------
+Streamlit app — Specifiek voor: Excel_Toets_V1_BIG_Antwoordmodel.xlsx
+=====================================================================
 
-Dit is een kant-en-klare Streamlit-app waarmee je:
-- Een **docentenbestand** (model) uploadt met een tabblad `antwoorden` en (optioneel) een tabblad `opgave`.
-- Eén of meerdere **studentbestanden** uploadt met uitwerkingen in (bijv.) tabblad `opgave`.
-- Automatisch vergelijkt op basis van een checklist uit het tabblad `antwoorden`.
-- Per student **percentage goed** en **welke vragen fout** ziet.
-- Per student een **feedback-Excel** kunt downloaden, plus een **overzichts-CSV**.
+Deze app is op maat gemaakt voor het meegeleverde **antwoordmodel** met de tabbladen:
+- `Instructie`, `Opdrachten`, **`Antwoorden`**, **`Transacties`**, **`Producten`**, **`Categorieën`**.
 
-Belangrijk over formules (bv. VERT.ZOEKEN):
-- Deze app leest **de laatst opgeslagen waarden** uit een Excel-bestand. Laat studenten dus **het bestand openen, alle formules laten berekenen en opslaan** voordat ze uploaden. 
-- Technisch: we gebruiken `openpyxl.load_workbook(..., data_only=True)` om de **gecachete** waarde van een formule te lezen (niet de formule zelf). Als Excel de formule nog niet heeft berekend (of het bestand is niet opnieuw opgeslagen), kan de waarde `None` zijn.
+Wat wordt automatisch nagekeken per studentbestand:
+- **O1. VERT.ZOEKEN / toewijzing categorie & productinfo** in `Transacties`:
+  - Controleert of kolom **Categorie** overeenkomt met de referentie (op basis van `Producten` ↔ `Categorieën`).
+- **O2. Omzet (Aantal × Prijs)** in `Transacties`:
+  - Controleert per rij of **Omzet ≈ Aantal × Prijs** en of **totaalomzet** klopt.
+- **O3. Omzet incl. 9% BTW voor categorie Groente**:
+  - Vergelijkt de som **Omzet(Groente) × 1.09** met de referentie.
+- **O4. Draaitabel-achtig resultaat: omzet per categorie**:
+  - Vergelijkt **som(Omzet) per Categorie** met de referentie.
+- **O12. AANTAL.ALS** (transacties per categorie):
+  - Controleert **aantal transacties voor 'Fruit'**.
 
-Structuur van het tabblad `antwoorden` (docentenbestand):
-- Vereist kolommen: 
-  - `vraag_id` (unieke naam per vraag, bv. V1, V2, ...),
-  - `sheet` (bv. `opgave`),
-  - `cel` (bv. `C12` of `A4`),
-  - `verwacht` (de juiste waarde zoals die in Excel hoort te staan, tekst/nummer/datum). 
-- Optionele kolommen (voor nauwkeurig vergelijken):
-  - `type` ∈ {`auto`, `text`, `number`, `date`, `bool`} (default `auto` → de app raadt op basis van `verwacht`),
-  - `tolerance` (numeriek; toegestaan verschil voor getallen, bv. 0.01),
-  - `case_sensitive` (TRUE/FALSE, alleen voor tekst, default FALSE),
-  - `normalize_space` (TRUE/FALSE; als TRUE, trimt en reduceert meervoudige spaties voor tekstvergelijking).
-- Tip: Laat `verwacht` leeg als je de **juiste waarde** wilt aflezen uit het **docentenbestand** zelf (tabblad + cel). In dat geval haalt de app de referentiewaarde uit het model.
+> **Belangrijk over formules (VERT.ZOEKEN, etc.)**
+> We lezen **de laatst opgeslagen waarden** (niet de formule). Laat studenten dus **het bestand openen, herberekenen en opslaan** vóór uploaden.
 
-Voorbeeld `antwoorden`:
-| vraag_id | sheet  | cel  | verwacht  | type   | tolerance | case_sensitive | normalize_space |
-|---------:|--------|------|-----------|--------|-----------|----------------|-----------------|
-| V1       | opgave | C12  | 825,5     | number | 0,1       | FALSE          | TRUE            |
-| V2       | opgave | D5   | Alfa BV   | text   |           | FALSE          | TRUE            |
-| V3       | opgave | B9   |           | auto   |           |                |                 |
-
-Installatie (lokaal):
-1) Maak een virtuele omgeving en installeer packages:
-   ```bash
-   pip install -r requirements.txt
-   ```
-   **requirements.txt** (maak dit bestand naast `app.py`):
-   ```
-   streamlit
-   pandas
-   openpyxl
-   numpy
-   ```
+Installatie (lokaal)
+--------------------
+1) Maak twee bestanden:
+   - `app.py` (dit bestand)
+   - `requirements.txt` met:
+     ```
+     streamlit
+     pandas
+     openpyxl
+     numpy
+     xlsxwriter
+     ```
 2) Start lokaal:
    ```bash
+   pip install -r requirements.txt
    streamlit run app.py
    ```
 
-Publiceren op **Streamlit Community Cloud**:
-1) Zet `app.py` en `requirements.txt` in een **GitHub-repository**.
-2) Ga naar https://streamlit.io/cloud → **New app** → kies je repo/branch → `app.py` als bestandsnaam.
-3) Klik **Deploy**. Deel de URL met collega’s. (Zorg dat je toegang instelt zoals gewenst; standaard moeten gebruikers inloggen met e-mail.)
+Publiceren op Streamlit Community Cloud
+---------------------------------------
+1) Zet `app.py` + `requirements.txt` in een **GitHub-repository**.
+2) Ga naar https://streamlit.io/cloud → **New app** → selecteer repo/branch → bestandsnaam: `app.py` → **Deploy**.
 
-Opzet op een (interne) server:
-- Zorg dat Python en de requirements aanwezig zijn en start met `streamlit run app.py --server.port 8501 --server.address 0.0.0.0`.
-- Publiceer poort 8501 achter reverse proxy (bv. Nginx) indien nodig.
-
-Copyright/licentie: Vrij te gebruiken binnen je onderwijscontext.
 """
 
 from __future__ import annotations
 import io
-from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 from openpyxl import load_workbook
-from openpyxl.worksheet.worksheet import Worksheet
 
 # =============================
-# Hulpfuncties: Excel inlezen
+# Config
 # =============================
 
-def _to_bytesio(uploaded_file) -> io.BytesIO:
-    """Lees een Streamlit UploadedFile in als BytesIO (zodat we het meerdere keren kunnen gebruiken)."""
+st.set_page_config(page_title="Excel Toets – Autonakijken (specifiek)", page_icon="✅", layout="wide")
+
+TOL = 0.01  # numerieke tolerantie bij vergelijken
+O1_MIN_MATCH = 0.98  # minimaal % correcte categorie-toewijzingen
+O2_MIN_MATCH = 0.98  # minimaal % correcte omzet-rijen
+BTW_GROENTE = 0.09   # 9% BTW
+
+# =============================
+# Utility: naam-normalisatie en kolomdetectie
+# =============================
+
+def norm(s: Any) -> str:
+    """Normaliseer een string voor robuuste matching van kolomnamen."""
+    if s is None:
+        return ""
+    s = str(s)
+    s = s.strip().lower()
+    # verwijder accenten/rare tekens grofweg
+    repl = {
+        "ä":"a","à":"a","á":"a","â":"a","ã":"a","å":"a",
+        "ë":"e","è":"e","é":"e","ê":"e",
+        "ï":"i","ì":"i","í":"i","î":"i",
+        "ö":"o","ò":"o","ó":"o","ô":"o","õ":"o",
+        "ü":"u","ù":"u","ú":"u","û":"u",
+        "ñ":"n","ç":"c","ß":"ss","ø":"o",
+        "€":"e"
+    }
+    for k,v in repl.items():
+        s = s.replace(k,v)
+    # laat alleen alfanumeriek + underscore
+    s = "".join(ch if ch.isalnum() else "_" for ch in s)
+    while "__" in s:
+        s = s.replace("__","_")
+    return s.strip("_")
+
+# Synoniemen voor kolommen in Transacties
+TX_COLS = {
+    "transactieid": {"transactieid", "transactie_id", "id", "transactionid"},
+    "datum": {"datum", "date"},
+    "productid": {"productid", "product_id"},
+    "aantal": {"aantal", "qty", "quantity"},
+    "productnaam": {"productnaam", "product", "product_name", "naam"},
+    "categoriecode": {"categoriecode", "categorie_code", "catcode", "code"},
+    "categorie": {"categorie", "category"},
+    "prijs": {"prijs", "price", "unitprice"},
+    "omzet": {"omzet", "revenue", "amount", "sales"},
+}
+
+# =============================
+# Excel inlezen
+# =============================
+
+def to_bytesio(uploaded_file) -> io.BytesIO:
     data = uploaded_file.read()
     return io.BytesIO(data)
 
 
-def _normalize_sheet_name(name: str) -> str:
-    """Normaliseer werkbladtitel: lowercased, zonder spaties/tekens, voor robuuste matching."""
-    if not isinstance(name, str):
-        return ""
-    return "".join(ch for ch in name.lower().strip() if ch.isalnum())
+def read_df(xlsx_bytes: io.BytesIO, sheet: str) -> pd.DataFrame:
+    xlsx_bytes.seek(0)
+    return pd.read_excel(xlsx_bytes, sheet_name=sheet, engine="openpyxl")
 
 
-def find_answers_sheet(model_bytes: io.BytesIO) -> Optional[str]:
-    """Zoek het 'antwoorden' tabblad case-insensitief, met een paar synoniemen.
-    Accepteert o.a. Antwoorden/ANTWOORDEN, Antwoord, Answers, Answer, AnswerKey, Model, Key.
-    Retourneert de exacte naam zoals die in het bestand staat, of None als niet gevonden.
+def get_columns(df: pd.DataFrame) -> Dict[str, str]:
+    """Map canonieke naam → echte kolomnaam in df, o.b.v. synoniemen."""
+    colmap: Dict[str, str] = {}
+    inv = {norm(c): c for c in df.columns}
+    for canon, syns in TX_COLS.items():
+        for s in syns:
+            n = norm(s)
+            # zoek of deze vorm exact voorkomt in genormaliseerde df-kolommen
+            if n in inv:
+                colmap[canon] = inv[n]
+                break
+        if canon not in colmap:
+            # tweede kans: zoek substring match in genormaliseerde kolommen
+            for nk, orig in inv.items():
+                if canon in nk or nk in canon:
+                    colmap[canon] = orig
+                    break
+    return colmap
+
+# =============================
+# Referentie opbouwen vanuit Antwoordmodel
+# =============================
+
+def build_reference(model_bytes: io.BytesIO) -> Dict[str, Any]:
+    """Maak referentiewaarden uit het Antwoordmodel.
+    - Som(Omzet) totaal
+    - Aantal transacties per categorie (we gebruiken 'Fruit' specifiek voor O12)
+    - Som(Omzet) per categorie
+    - Som(Omzet) voor 'Groente' incl. 9% BTW
     """
-    # Probeer eerst via openpyxl (snel)
-    model_bytes.seek(0)
-    names: List[str] = []
-    try:
-        wb = load_workbook(filename=model_bytes, data_only=True, read_only=True)
-        names = list(wb.sheetnames)
-    except Exception:
-        names = []
+    dfT = read_df(model_bytes, "Transacties")
 
-    # Fallback via pandas.ExcelFile
-    if not names:
-        model_bytes.seek(0)
-        try:
-            xls = pd.ExcelFile(model_bytes, engine="openpyxl")
-            names = list(xls.sheet_names)
-        except Exception:
-            names = []
+    # Pak herkenbare kolommen
+    colmap = get_columns(dfT)
+    c_cat = colmap.get("categorie")
+    c_omz = colmap.get("omzet")
+    if not c_cat or not c_omz:
+        raise ValueError("Model mist kolommen 'Categorie' en/of 'Omzet' in tabblad 'Transacties'.")
 
-    if not names:
-        return None
+    # Totaalomzet
+    total_omzet = float(round(dfT[c_omz].sum(), 2))
 
-    norm_map = {_normalize_sheet_name(n): n for n in names}
-    wanted_exact = [
-        "antwoorden", "antwoord", "answers", "answer", "answerkey", "model", "key",
-    ]
+    # Aantallen per categorie
+    counts_by_cat = dfT[c_cat].value_counts(dropna=False).to_dict()
 
-    for w in wanted_exact:
-        if w in norm_map:
-            return norm_map[w]
+    # Omzet per categorie
+    omzet_by_cat = dfT.groupby(c_cat)[c_omz].sum().round(2).to_dict()
 
-    # Substring match als laatste redmiddel
-    for k, v in norm_map.items():
-        if ("antwoord" in k) or ("answer" in k):
-            return v
+    # Omzet incl. BTW voor Groente
+    groente_mask = dfT[c_cat].astype(str).str.lower() == "groente"
+    groente_omzet_incl = float(round(dfT.loc[groente_mask, c_omz].sum() * (1.0 + BTW_GROENTE), 2))
 
-    return None
-
-
-def _norm(s: str) -> str:
-    """Normaliseer kolomnamen: lower + alleen alfanumeriek."""
-    if not isinstance(s, str):
-        s = str(s)
-    return "".join(ch for ch in s.lower().strip() if ch.isalnum())
-
-
-def _map_answers_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Map mogelijke kolom-synoniemen naar canonieke namen.
-    Vereist uiteindelijk: vraag_id, sheet, cel. 'verwacht' is optioneel en kan ontbreken.
-    """
-    # Synoniemen per veld (genormaliseerde vormen)
-    synonyms = {
-        "vraag_id": {"vraagid", "vraag", "id", "vraagnummer", "vraagnr", "vraagnr", "vraagnr", "q", "qid", "questionid", "vraagnr", "vraagnr"},
-        "sheet": {"sheet", "tabblad", "blad", "sheetname", "sheetnaam", "worksheet", "bladnaam"},
-        "cel": {"cel", "cell", "cellref", "cellreference", "celref", "celadres", "celladdress", "address", "adres", "celadres"},
-        "verwacht": {"verwacht", "expected", "expectedvalue", "expected_value", "answer", "antwoord", "answerkey", "key", "modelwaarde", "referentie", "referentiewaarde", "juistewaarde", "juiste_waarde"},
-        "type": {"type", "valuetype", "waarde", "waardetype"},
-        "tolerance": {"tolerance", "tolerantie", "tol", "marge", "margin"},
-        "case_sensitive": {"casesensitive", "case", "hoofdlettergevoelig", "casesensitief"},
-        "normalize_space": {"normalizespace", "spatiesnormaliseren", "strip", "trim", "normaliseer", "collapsespace"},
+    return {
+        "total_omzet": total_omzet,
+        "counts_by_cat": counts_by_cat,
+        "omzet_by_cat": omzet_by_cat,
+        "groente_omzet_incl": groente_omzet_incl,
     }
 
-    # Bouw mapping: genormaliseerde naam → canonieke naam
-    canon_by_norm = {}
-    for canon, alts in synonyms.items():
-        for a in alts:
-            canon_by_norm[a] = canon
+# =============================
+# Checks op studentbestand
+# =============================
 
-    new_cols = {}
-    taken = set()
-    for c in df.columns:
-        n = _norm(c)
-        target = canon_by_norm.get(n, None)
-        if target is None:
-            # niet in synoniemen → normaliseer naar huidige (bv. 'verwacht' blijft 'verwacht' als al zo)
-            target = c.strip().lower()
-        # voorkom dubbelingen: eerste wint
-        if target in taken:
-            continue
-        new_cols[c] = target
-        taken.add(target)
+def score_student(student_bytes: io.BytesIO, ref: Dict[str, Any]) -> Tuple[pd.DataFrame, float]:
+    dfT = read_df(student_bytes, "Transacties")
+    colmap = get_columns(dfT)
 
-    df = df.rename(columns=new_cols)
+    # Kolomnamen uit student (sommige kunnen ontbreken)
+    c_cat = colmap.get("categorie")
+    c_prijs = colmap.get("prijs")
+    c_aantal = colmap.get("aantal")
+    c_omzet = colmap.get("omzet")
+    c_prodid = colmap.get("productid")
 
-    # Zorg dat 'verwacht' aanwezig is (mag leeg zijn)
-    if "verwacht" not in df.columns:
-        df["verwacht"] = pd.NA
+    details = []
 
-    return df
+    # O1: Categorie-toewijzing
+    # Voor referentie gebruiken we het Antwoordmodel → omzet_by_cat/ counts_by_cat helpen indirect,
+    # maar we willen per-rij check. Daarom reconstrueren we de juiste categorie via 'Producten'+'Categorieën'
+    # uit het studentenbestand indien aanwezig, anders uit het modelbestand → daarvoor vragen we model opnieuw aan.
 
-
-def load_answers_df(model_bytes: io.BytesIO) -> pd.DataFrame:
-    """Lees het antwoorden-tabblad als DataFrame.
-    Robuust voor variaties in tabbladnaam en kolomnamen. 
-    Vereist minimaal kolommen: `vraag_id`, `sheet`, `cel`. `verwacht` is optioneel; als leeg ontbreekt, haalt de app de referentie uit het modelbestand.
-    """
-    # Zoek het juiste tabblad (case-insensitief + synoniemen)
-    sheet = find_answers_sheet(model_bytes)
-    if not sheet:
-        # Haal lijst met bladen voor foutmelding
-        model_bytes.seek(0)
-        try:
-            wb = load_workbook(filename=model_bytes, data_only=True, read_only=True)
-            available = ", ".join(wb.sheetnames)
-        except Exception:
-            available = "onbekend"
-        raise ValueError(
-            "Tabblad 'antwoorden' niet gevonden. Hernoem het antwoordenblad naar 'antwoorden' (of 'Antwoorden'). "
-            f"Gevonden tabbladen: {available}"
-        )
-
-    # Lees het gevonden tabblad in pandas
-    model_bytes.seek(0)
-    df = pd.read_excel(model_bytes, sheet_name=sheet, engine="openpyxl")
-
-    # Normaliseer & map kolomnamen
-    df = _map_answers_columns(df)
-
-    # Normaliseer kolomnamen nogmaals naar lower/strip (verzekerd)
-    df.columns = [str(c).strip().lower() for c in df.columns]
-
-    # Minimaal vereiste kolommen
-    required_min = {"vraag_id", "sheet", "cel"}
-    missing = required_min - set(df.columns)
-    if missing:
-        found_cols = ", ".join(map(str, df.columns))
-        msg = (
-            "Het antwoordenblad mist verplichte kolommen: {missing}. Gevonden kolommen: {found}.
-"
-            "Accepteerde namen (synoniemen):
-"
-            "- vraag_id: vraag_id, vraag, id, vraagnummer, q, qid
-"
-            "- sheet: sheet, tabblad, blad, bladnaam, worksheet
-"
-            "- cel: cel, cell, celadres, cellref, address
-"
-            "- verwacht (optioneel): verwacht, expected, antwoord, key"
-        ).format(missing=", ".join(sorted(missing)), found=found_cols)
-        raise ValueError(msg))}. Gevonden kolommen: {found}.
-"
-            "Accepteerde namen (synoniemen):
-"
-            "- vraag_id: vraag_id, vraag, id, vraagnummer, q, qid
-"
-            "- sheet: sheet, tabblad, blad, bladnaam, worksheet
-"
-            "- cel: cel, cell, celadres, cellref, address
-"
-            "- verwacht (optioneel): verwacht, expected, antwoord, key"
-        )
-
-    # Zorg voor optionele kolommen met defaults
-    if "type" not in df.columns:
-        df["type"] = "auto"
-    if "tolerance" not in df.columns:
-        df["tolerance"] = np.nan
-    if "case_sensitive" not in df.columns:
-        df["case_sensitive"] = False
-    if "normalize_space" not in df.columns:
-        df["normalize_space"] = True
-
-    # Cast booleans netjes (True/False/1/0/"TRUE"/"FALSE")
-    df["case_sensitive"] = df["case_sensitive"].apply(_to_bool)
-    df["normalize_space"] = df["normalize_space"].apply(_to_bool)
-
-    return df
-
-
-def _to_bool(x: Any) -> bool:
-    if isinstance(x, str):
-        x = x.strip().lower()
-        if x in {"true", "waar", "yes", "ja"}:
-            return True
-        if x in {"false", "onwaar", "no", "nee"}:
-            return False
-    if isinstance(x, (int, float)):
-        return bool(x)
-    return bool(x) if x is not None else False
-
-
-def open_workbook(bytes_io: io.BytesIO, data_only: bool = True):
-    """Open een Excel workbook met openpyxl. data_only=True → lees geformatteerde/laatst berekende waarden."""
-    bytes_io.seek(0)
-    return load_workbook(filename=bytes_io, data_only=data_only)
-
-
-def get_ws_value(ws: Worksheet, cell_ref: str) -> Any:
-    """Haal de waarde uit een werkbladcel (bv. 'C12'). Geeft None terug als cel buiten bereik is."""
+    # Lees (voor O1) product- en categorie-tab uit student; zo niet aanwezig, val terug op model
     try:
-        return ws[cell_ref].value
+        dfP_s = read_df(student_bytes, "Producten")
+        dfC_s = read_df(student_bytes, "Categorieën")
+        use_student_lookup = True
     except Exception:
-        return None
-
-
-# =============================
-# Vergelijkingslogica
-# =============================
-
-def canonicalize_text(x: Any, *, normalize_space: bool, case_sensitive: bool) -> str:
-    if x is None or (isinstance(x, float) and np.isnan(x)):
-        return ""
-    s = str(x)
-    if normalize_space:
-        # Strip en collapse meerdere spaties
-        s = " ".join(s.strip().split())
-    if not case_sensitive:
-        s = s.lower()
-    return s
-
-
-def parse_number(x: Any) -> Optional[float]:
-    if x is None or (isinstance(x, float) and np.isnan(x)):
-        return None
-    if isinstance(x, (int, float, np.integer, np.floating)):
-        return float(x)
-    s = str(x).strip()
-    # Ondersteun NL notatie met komma ("825,5")
-    s = s.replace(" ", "")
-    if "," in s and "." not in s:
-        s = s.replace(",", ".")
-    try:
-        return float(s)
-    except Exception:
-        return None
-
-
-def infer_type(expected: Any, declared: str) -> str:
-    declared = (declared or "auto").strip().lower()
-    if declared != "auto":
-        return declared
-    # Heuristiek op basis van "verwacht"
-    if isinstance(expected, (int, float, np.integer, np.floating)):
-        return "number"
-    if isinstance(expected, (pd.Timestamp,)):
-        return "date"
-    if isinstance(expected, (bool,)):
-        return "bool"
-    # Check of tekst op getal lijkt
-    if parse_number(expected) is not None:
-        return "number"
-    return "text"
-
-
-def compare_value(
-    got: Any,
-    expected: Any,
-    *,
-    value_type: str,
-    tolerance: Optional[float],
-    case_sensitive: bool,
-    normalize_space: bool,
-) -> Tuple[bool, str]:
-    """Vergelijk studentwaarde met verwacht. Retourneert (is_goed, uitleg)."""
-    vt = value_type.lower()
-
-    if vt == "number":
-        g = parse_number(got)
-        e = parse_number(expected)
-        if g is None or e is None:
-            return False, f"Kon getal niet interpreteren (student='{got}', verwacht='{expected}')"
-        tol = float(tolerance) if tolerance is not None and not pd.isna(tolerance) else 0.0
-        ok = abs(g - e) <= tol
-        return ok, f"student={g} / verwacht={e} / tol={tol}"
-
-    if vt == "date":
-        # Voor simpelheid: vergelijk als tekst na normalisatie van datumrepresentaties
-        try:
-            g = pd.to_datetime(got) if not pd.isna(got) else pd.NaT
-            e = pd.to_datetime(expected) if not pd.isna(expected) else pd.NaT
-            ok = (pd.isna(g) and pd.isna(e)) or (not pd.isna(g) and not pd.isna(e) and g.normalize() == e.normalize())
-            return ok, f"student={g.date() if not pd.isna(g) else None} / verwacht={e.date() if not pd.isna(e) else None}"
-        except Exception:
-            return False, f"Kon datum niet interpreteren (student='{got}', verwacht='{expected}')"
-
-    if vt == "bool":
-        mapping = {"true": True, "false": False, "waar": True, "onwaar": False, "ja": True, "nee": False}
-        def to_bool(v):
-            if isinstance(v, bool):
-                return v
-            if isinstance(v, (int, float)) and not pd.isna(v):
-                return bool(v)
-            s = str(v).strip().lower()
-            return mapping.get(s, None)
-        g = to_bool(got)
-        e = to_bool(expected)
-        ok = (g is not None) and (e is not None) and (g == e)
-        return ok, f"student={g} / verwacht={e}"
-
-    # text (default)
-    g = canonicalize_text(got, normalize_space=normalize_space, case_sensitive=case_sensitive)
-    e = canonicalize_text(expected, normalize_space=normalize_space, case_sensitive=case_sensitive)
-    ok = g == e
-    return ok, f"student='{g}' / verwacht='{e}' / case_sensitive={case_sensitive}"
-
-
-# =============================
-# Scoren per student
-# =============================
-
-@dataclass
-class ScoreItem:
-    vraag_id: str
-    sheet: str
-    cel: str
-    student_waarde: Any
-    verwacht: Any
-    type: str
-    tolerance: Optional[float]
-    case_sensitive: bool
-    normalize_space: bool
-    goed: bool
-    uitleg: str
-
-
-def score_student(
-    student_wb,  # openpyxl workbook (data_only=True)
-    answers_df: pd.DataFrame,
-    model_wb=None,  # openpyxl workbook met model (voor fallback verwacht-waarden)
-) -> List[ScoreItem]:
-    results: List[ScoreItem] = []
-
-    # Werkblad cache
-    ws_cache: Dict[str, Worksheet] = {}
-
-    for _, row in answers_df.iterrows():
-        vraag_id = str(row["vraag_id"]).strip()
-        sheet = str(row["sheet"]).strip()
-        cel = str(row["cel"]).strip()
-        declared_type = str(row.get("type", "auto")).strip().lower()
-        tolerance = row.get("tolerance", np.nan)
-        case_sensitive = _to_bool(row.get("case_sensitive", False))
-        normalize_space = _to_bool(row.get("normalize_space", True))
-
-        # Verwacht-waarde: uit kolom of (indien leeg/NaN) uit model-wb lezen
-        expected = row.get("verwacht", None)
-        if pd.isna(expected) or expected is None or str(expected).strip() == "":
-            expected = None
-            if model_wb is not None:
-                try:
-                    if sheet not in model_wb.sheetnames:
-                        expected = None
-                    else:
-                        ws_model = model_wb[sheet]
-                        expected = get_ws_value(ws_model, cel)
-                except Exception:
-                    expected = None
-
-        # Studentwaarde lezen
-        try:
-            if sheet not in ws_cache:
-                if sheet not in student_wb.sheetnames:
-                    ws_cache[sheet] = None  # markeer ontbrekend
-                else:
-                    ws_cache[sheet] = student_wb[sheet]
-            ws = ws_cache.get(sheet)
-            student_val = get_ws_value(ws, cel) if ws is not None else None
-        except Exception:
-            student_val = None
-
-        # Type bepalen en vergelijken
-        vtype = infer_type(expected, declared_type)
-        goed, uitleg = compare_value(
-            student_val,
-            expected,
-            value_type=vtype,
-            tolerance=None if pd.isna(tolerance) else float(tolerance),
-            case_sensitive=case_sensitive,
-            normalize_space=normalize_space,
-        )
-
-        results.append(
-            ScoreItem(
-                vraag_id=vraag_id,
-                sheet=sheet,
-                cel=cel,
-                student_waarde=student_val,
-                verwacht=expected,
-                type=vtype,
-                tolerance=None if pd.isna(tolerance) else float(tolerance),
-                case_sensitive=case_sensitive,
-                normalize_space=normalize_space,
-                goed=goed,
-                uitleg=uitleg,
-            )
-        )
-
-    return results
-
-
-def to_details_df(items: List[ScoreItem]) -> pd.DataFrame:
-    rows = []
-    for it in items:
-        rows.append(
-            {
-                "vraag_id": it.vraag_id,
-                "sheet": it.sheet,
-                "cel": it.cel,
-                "student": it.student_waarde,
-                "verwacht": it.verwacht,
-                "type": it.type,
-                "tolerance": it.tolerance,
-                "goed": "JA" if it.goed else "NEE",
-                "uitleg": it.uitleg,
-            }
-        )
-    df = pd.DataFrame(rows)
-    # Sorteer op vraag_id als het nummeriek/alfanumeriek is
-    with pd.option_context("mode.chained_assignment", None):
-        try:
-            df["_sort"] = df["vraag_id"].str.extract(r"(\d+)").astype(float)
-            df = df.sort_values(["_sort", "vraag_id"]).drop(columns=["_sort"]) 
-        except Exception:
-            df = df.sort_values(["vraag_id"]) 
-    return df
-
-
-def pct_correct(items: List[ScoreItem]) -> float:
-    if not items:
-        return 0.0
-    good = sum(1 for x in items if x.goed)
-    return round(100.0 * good / len(items), 1)
-
-
-# =============================
-# Exports: feedback Excel & CSV
-# =============================
-
-import xlsxwriter  # gebruikt door pandas ExcelWriter(engine="xlsxwriter") voor formatting
-
-def build_feedback_excel(student_name: str, details_df: pd.DataFrame) -> bytes:
-    """Genereer een Excel met een 'feedback'-tabblad en eenvoudige conditional formatting."""
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-        details_df.to_excel(writer, index=False, sheet_name="feedback")
-        workbook = writer.book
-        worksheet = writer.sheets["feedback"]
-
-        # Zoeker naar kolommen
-        headers = list(details_df.columns)
-        try:
-            goed_col = headers.index("goed")
-        except ValueError:
-            goed_col = None
-
-        # Conditional formatting: kleur JA/NEE
-        if goed_col is not None:
-            nrows, ncols = details_df.shape
-            start_row, start_col = 1, goed_col  # data begint op rij 2 in Excel
-            end_row, end_col = nrows, goed_col
-            rng = xlsxwriter.utility.xl_range(start_row, start_col, end_row, end_col)
-
-            fmt_ok = workbook.add_format({"bg_color": "#C6EFCE", "font_color": "#006100"})
-            fmt_bad = workbook.add_format({"bg_color": "#FFC7CE", "font_color": "#9C0006"})
-
-            worksheet.conditional_format(rng, {"type": "text", "criteria": "containing", "value": "JA", "format": fmt_ok})
-            worksheet.conditional_format(rng, {"type": "text", "criteria": "containing", "value": "NEE", "format": fmt_bad})
-
-        # Autofit kolommen (ruwweg)
-        for i, col in enumerate(details_df.columns):
-            width = max(10, int(details_df[col].astype(str).map(len).max()) + 2)
-            worksheet.set_column(i, i, min(width, 60))
-
-        # Koptekst met studentnaam
-        worksheet.write(0, 0, f"Feedback voor: {student_name}")
-
-    return output.getvalue()
-
-
-def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
-    return df.to_csv(index=False).encode("utf-8")
-
-
-# =============================
-# Streamlit UI
-# =============================
-
-st.set_page_config(page_title="Excel Autonakijken", page_icon="✅", layout="wide")
-
-st.title("✅ Excel-opdrachten automatisch nakijken")
-
-st.markdown(
-    """
-Upload hieronder eerst je **docentenbestand** met het tabblad `antwoorden` en (optioneel) `opgave`. 
-Upload daarna één of meerdere **studentbestanden**. De app vergelijkt waarden per `sheet` + `cel` uit je `antwoorden`-tabel.
-
-> **Tip:** Zorg dat studenten hun bestand **opslaan nadat formules berekend zijn** (anders leest de app soms `None`).
-    """
-)
-
-with st.sidebar:
-    st.header("Stap 1 — Upload bestanden")
-    model_file = st.file_uploader(
-        "Docentenbestand (Excel, met tabblad 'antwoorden')", type=["xlsx", "xlsm"], key="model"
-    )
-    student_files = st.file_uploader(
-        "Studentbestanden (meerdere toegestaan)", type=["xlsx", "xlsm"], accept_multiple_files=True, key="students"
-    )
-
-    st.divider()
-    st.header("Vergelijk-instellingen (defaults)")
-    default_tol = st.number_input("Standaardtolerantie voor getallen (indien leeg)", value=0.0, step=0.01, format="%.2f")
-    default_case = st.checkbox("Hoofdlettergevoelig (tekst)", value=False)
-    default_norm = st.checkbox("Spaties normaliseren (tekst)", value=True)
-
-if not model_file:
-    st.info("⬅️ Upload eerst het docentenbestand in de sidebar.")
-    st.stop()
-
-# Lees model als DataFrame (antwoorden) en als workbook (voor eventueel verwachte waarden uit model)
-model_bytes = _to_bytesio(model_file)
-answers_df = load_answers_df(model_bytes)
-model_wb = open_workbook(_to_bytesio(model_file), data_only=True)
-
-# Vul standaardwaarden in als de optionele kolommen leeg zijn
-with pd.option_context("mode.chained_assignment", None):
-    answers_df["type"] = answers_df["type"].fillna("auto").replace("", "auto")
-    answers_df["tolerance"] = answers_df["tolerance"].fillna(default_tol)
-    answers_df["case_sensitive"] = answers_df["case_sensitive"].fillna(default_case)
-    answers_df["normalize_space"] = answers_df["normalize_space"].fillna(default_norm)
-
-st.subheader("Checklist uit \u2018antwoorden\u2019")
-st.dataframe(
-    answers_df,
-    use_container_width=True,
-    hide_index=True,
-)
-
-if not student_files:
-    st.info("⬅️ Upload nu één of meer studentbestanden in de sidebar.")
-    st.stop()
-
-st.subheader("Resultaten per student")
-
-summary_rows = []
-all_zip_parts: List[Tuple[str, bytes]] = []  # (filename, bytes)
-
-for up in student_files:
-    student_name = up.name
-    st.markdown(f"### 👩‍🎓 {student_name}")
-
-    # Open student workbook
-    student_wb = open_workbook(_to_bytesio(up), data_only=True)
-
-    # Score
-    items = score_student(student_wb, answers_df, model_wb=model_wb)
-    details = to_details_df(items)
-    pct = pct_correct(items)
-
-    # Toon samenvatting + details
-    col1, col2 = st.columns([1, 2])
-    with col1:
-        st.metric("% goed", f"{pct}%")
-        n_good = int((details["goed"] == "JA").sum())
-        n_total = int(len(details))
-        st.caption(f"Goed: {n_good} / Totaal: {n_total}")
-    with col2:
-        st.dataframe(details, use_container_width=True, hide_index=True)
-
-    # Exports per student
-    fb_bytes = build_feedback_excel(student_name, details)
-    st.download_button(
-        label="📥 Download feedback (Excel)",
-        data=fb_bytes,
-        file_name=f"feedback_{student_name.replace('.xlsx','')}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        key=f"dl_{student_name}_xlsx",
-    )
-
-    csv_bytes = df_to_csv_bytes(details)
-    st.download_button(
-        label="📥 Download details (CSV)",
-        data=csv_bytes,
-        file_name=f"details_{student_name.replace('.xlsx','')}.csv",
-        mime="text/csv",
-        key=f"dl_{student_name}_csv",
-    )
-
-    # Voor overzichts-CSV
-    summary_rows.append({"student": student_name, "%_goed": pct, "goed": n_good, "totaal": len(details)})
-
-    # Verzamel voor ZIP (optioneel later)
-    all_zip_parts.append((f"feedback_{student_name.replace('.xlsx','')}.xlsx", fb_bytes))
-    all_zip_parts.append((f"details_{student_name.replace('.xlsx','')}.csv", csv_bytes))
-
-# Totaaloverzicht
-summary_df = pd.DataFrame(summary_rows).sort_values(["%_goed", "student"], ascending=[False, True])
-st.markdown("### 📊 Overzicht alle studenten")
-st.dataframe(summary_df, use_container_width=True, hide_index=True)
-
-st.download_button(
-    label="📥 Download overzicht (CSV)",
-    data=df_to_csv_bytes(summary_df),
-    file_name="overzicht_scores.csv",
-    mime="text/csv",
-    key="dl_overzicht_csv",
-)
-
-# (Optioneel) alles in één ZIP
-import zipfile
-
-def build_zip(parts: List[Tuple[str, bytes]]) -> bytes:
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for fname, b in parts:
-            zf.writestr(fname, b)
-    return buf.getvalue()
-
-if len(all_zip_parts) > 0:
-    st.download_button(
-        label="📦 Download alles als ZIP",
-        data=build_zip(all_zip_parts),
-        file_name="alle_feedback_en_details.zip",
-        mime="application/zip",
-        key="dl_zip_all",
-    )
-
-# =============================
-# Veelvoorkomende valkuilen & tips
-# =============================
-with st.expander("ℹ️ Tips & valkuilen"):
-    st.markdown(
-        """
-- **Formules geven `None`**: Laat studenten het bestand **openen en opslaan**, zodat Excel de formules herberekent en bewaart.
-- **Scheidingsteken**: Deze app ondersteunt komma als decimaalteken (NL). Gebruik eventueel `tolerance` om afrondingsverschillen te absorberen.
-- **Tekst-vergelijking**: Standaard niet hoofdlettergevoelig en normaliseert spaties; pas aan via kolommen of de sidebar.
-- **Verwacht leeg**: Als `verwacht` leeg is, probeert de app de referentiewaarde uit het **modelbestand** te lezen op `sheet` + `cel`.
-- **Extra checks**: Voeg rijen toe aan `antwoorden` voor elke cel die je wilt controleren — dus ook tussenresultaten.
-- **Datumvelden**: Worden op dag-niveau vergeleken; wil je tijd meenemen, pas de functie `compare_value` aan.
-        """
-    )
+        use_student_lookup = False
+
+    # Als student geen lookup-tabbladen heeft, haal we uit model via ref2 (lazy: we bouwen binnen deze functie kortstondig een lookup uit student_bytes → lukt niet → foutmelding vriendelijk)
+    if use_student_lookup:
+        # Bouw mapping ProductID -> (Prijs, Categorie)
+        # Probeer kolommen te vinden
+        def get_col(df, candidates):
+            inv = {norm(c): c for c in df.columns}
+            for cand in candidates:
+                if norm(cand) in inv:
+                    return inv[norm(cand)]
+            return None
+
+        p_pid = get_col(dfP_s, ["ProductID", "product_id"])
+        p_name = get_col(dfP_s, ["Product", "productnaam", "naam"])
+        p_catcode = get_col(dfP_s, ["CategorieCode", "categorie_code", "code"])
+        p_prijs = get_col(dfP_s, ["Prijs", "price"])
+
+        c_code = get_col(dfC_s, ["Code", "categoriecode", "code"])
+        c_catname = get_col(dfC_s, ["Categorie", "category"])
+
+        if not (p_pid and p_prijs and p_catcode and c_code and c_catname and c_prodid):
+            use_student_lookup = False
+
+    if use_student_lookup:
+        dfP_s = dfP_s[[p_pid, p_catcode, p_prijs]].dropna()
+        dfC_s = dfC_s[[c_code, c_catname]].dropna()
+        dfPC = dfP_s.merge(dfC_s, left_on=p_catcode, right_on=c_code, how="left")
+        dfPC = dfPC.rename(columns={p_pid: "ProductID", p_prijs: "Prijs_ref", c_catname: "Categorie_ref"})
+        df_check = dfT.merge(dfPC[["ProductID", "Prijs_ref", "Categorie_ref"]], left_on=c_prodid, right_on="ProductID", how="left")
+        cat_match = (df_check[c_cat].astype(str).str.strip().str.lower() == df_check["Categorie_ref"].astype(str).str.strip().str.lower()) if c_cat in df_check.columns else pd.Series(False, index=df_check.index)
+        cat_match_rate = float(round(cat_match.mean() if len(cat_match) else 0.0, 3))
+        o1_ok = (cat_match_rate >= O1_MIN_MATCH)
+        details.append({
+            "opdracht": "O1 — Categorie toewijzing",
+            "resultaat": "GOED" if o1_ok else "FOUT",
+            "uitleg": f"Match-rate categorie: {cat_match_rate*100:.1f}% (min {O1_MIN_MATCH*100:.0f}%).",
+        })
+    else:
+        # Kan student-lookup niet bepalen → we keuren O1 af maar met duidelijke hint
+        details.append({
+            "opdracht": "O1 — Categorie toewijzing",
+            "resultaat": "FOUT",
+            "uitleg": "Kon tabbladen 'Producten'/'Categorieën' in studentbestand niet betrouwbaar lezen. Controleer VERT.ZOEKEN/X.ZOEKEN en kolommen.",
+        })
+        o1_ok = False
+
+    # O2: Omzet = Aantal × Prijs en totaalomzet
+    if c_aantal and c_prijs and c_omzet:
+        # Per-rij vergelijking
+        calc = (dfT[c_aantal].astype(float) * dfT[c_prijs].astype(float)).round(2)
+        diff = (calc - dfT[c_omzet].astype(float)).abs() <= TOL
+        row_rate = float(round(diff.mean(), 3)) if len(diff) else 0.0
+        # Totaal
+        total_student = float(round(dfT[c_omzet].astype(float).sum(), 2))
+        total_ref = float(ref["total_omzet"])  # uit model
+        total_ok = abs(total_student - total_ref) <= TOL
+        o2_ok = (row_rate >= O2_MIN_MATCH) and total_ok
+        details.append({
+            "opdracht": "O2 — Omzet (Aantal×Prijs) & totaal",
+            "resultaat": "GOED" if o2_ok else "FOUT",
+            "uitleg": f"Rij-accuraat: {row_rate*100:.1f}%, totaal: student={total_student:.2f} / ref={total_ref:.2f}.",
+        })
+    else:
+        details.append({
+            "opdracht": "O2 — Omzet (Aantal×Prijs) & totaal",
+            "resultaat": "FOUT",
+            "uitleg": "Ontbrekende kolommen in 'Transacties' (benodigd: Aantal, Prijs, Omzet).",
+        })
+        o2_ok = False
+
+    # O3: Omzet incl. 9% BTW (alleen Groente)
+    if c_cat and c_omzet:
+        groente_mask = dfT[c_cat].astype(str).str.lower() == "groente"
+        groente_student = float(round(dfT.loc[groente_mask, c_omzet].astype(float).sum() * (1.0 + BTW_GROENTE), 2))
+        groente_ref = float(ref["groente_omzet_incl"])
+        o3_ok = abs(groente_student - groente_ref) <= TOL
+        details.append({
+            "opdracht": "O3 — Groente omzet incl. 9% BTW",
+            "resultaat": "GOED" if o3_ok else "FOUT",
+            "uitleg": f"student={groente_student:.2f} / ref={groente_ref:.2f} (tolerantie ±{TOL}).",
+        })
+    else:
+        details.append({
+            "opdracht": "O3 — Groente omzet incl. 9% BTW",
+            "resultaat": "FOUT",
+            "uitleg": "Benodigd: kolommen 'Categorie' en 'Omzet' in 'Transacties'.",
+        })
+        o3_ok = False
+
+    # O4: Omzet per categorie (draaitabel)
+    if c_cat and c_omzet:
+        by_cat_student = dfT.groupby(c_cat)[c_omzet].sum().round(2)
+        by_cat_ref = pd.S

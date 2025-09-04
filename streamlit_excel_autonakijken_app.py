@@ -219,10 +219,9 @@ def load_answers_df(model_bytes: io.BytesIO) -> pd.DataFrame:
     required_min = {"vraag_id", "sheet", "cel"}
     missing = required_min - set(df.columns)
     if missing:
-        found = ", ".join(df.columns)
+        found_cols = ", ".join(map(str, df.columns))
         msg = (
-            "Het antwoordenblad mist verplichte kolommen: "
-            f"{', '.join(sorted(missing))}. Gevonden kolommen: {found}.
+            "Het antwoordenblad mist verplichte kolommen: {missing}. Gevonden kolommen: {found}.
 "
             "Accepteerde namen (synoniemen):
 "
@@ -233,7 +232,7 @@ def load_answers_df(model_bytes: io.BytesIO) -> pd.DataFrame:
             "- cel: cel, cell, celadres, cellref, address
 "
             "- verwacht (optioneel): verwacht, expected, antwoord, key"
-        )
+        ).format(missing=", ".join(sorted(missing)), found=found_cols)
         raise ValueError(msg))}. Gevonden kolommen: {found}.
 "
             "Accepteerde namen (synoniemen):

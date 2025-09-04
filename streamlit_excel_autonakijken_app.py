@@ -133,10 +133,62 @@ def find_answers_sheet(model_bytes: io.BytesIO) -> Optional[str]:
     return None
 
 
+def _norm(s: str) -> str:
+    """Normaliseer kolomnamen: lower + alleen alfanumeriek."""
+    if not isinstance(s, str):
+        s = str(s)
+    return "".join(ch for ch in s.lower().strip() if ch.isalnum())
+
+
+def _map_answers_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Map mogelijke kolom-synoniemen naar canonieke namen.
+    Vereist uiteindelijk: vraag_id, sheet, cel. 'verwacht' is optioneel en kan ontbreken.
+    """
+    # Synoniemen per veld (genormaliseerde vormen)
+    synonyms = {
+        "vraag_id": {"vraagid", "vraag", "id", "vraagnummer", "vraagnr", "vraagnr", "vraagnr", "q", "qid", "questionid", "vraagnr", "vraagnr"},
+        "sheet": {"sheet", "tabblad", "blad", "sheetname", "sheetnaam", "worksheet", "bladnaam"},
+        "cel": {"cel", "cell", "cellref", "cellreference", "celref", "celadres", "celladdress", "address", "adres", "celadres"},
+        "verwacht": {"verwacht", "expected", "expectedvalue", "expected_value", "answer", "antwoord", "answerkey", "key", "modelwaarde", "referentie", "referentiewaarde", "juistewaarde", "juiste_waarde"},
+        "type": {"type", "valuetype", "waarde", "waardetype"},
+        "tolerance": {"tolerance", "tolerantie", "tol", "marge", "margin"},
+        "case_sensitive": {"casesensitive", "case", "hoofdlettergevoelig", "casesensitief"},
+        "normalize_space": {"normalizespace", "spatiesnormaliseren", "strip", "trim", "normaliseer", "collapsespace"},
+    }
+
+    # Bouw mapping: genormaliseerde naam → canonieke naam
+    canon_by_norm = {}
+    for canon, alts in synonyms.items():
+        for a in alts:
+            canon_by_norm[a] = canon
+
+    new_cols = {}
+    taken = set()
+    for c in df.columns:
+        n = _norm(c)
+        target = canon_by_norm.get(n, None)
+        if target is None:
+            # niet in synoniemen → normaliseer naar huidige (bv. 'verwacht' blijft 'verwacht' als al zo)
+            target = c.strip().lower()
+        # voorkom dubbelingen: eerste wint
+        if target in taken:
+            continue
+        new_cols[c] = target
+        taken.add(target)
+
+    df = df.rename(columns=new_cols)
+
+    # Zorg dat 'verwacht' aanwezig is (mag leeg zijn)
+    if "verwacht" not in df.columns:
+        df["verwacht"] = pd.NA
+
+    return df
+
+
 def load_answers_df(model_bytes: io.BytesIO) -> pd.DataFrame:
     """Lees het antwoorden-tabblad als DataFrame.
-    Robuust voor variaties in tabbladnaam en geeft duidelijke foutmelding met gevonden tabbladen.
-    Vereist kolommen: vraag_id, sheet, cel, verwacht (verwacht mag leeg zijn).
+    Robuust voor variaties in tabbladnaam en kolomnamen. 
+    Vereist minimaal kolommen: `vraag_id`, `sheet`, `cel`. `verwacht` is optioneel; als leeg ontbreekt, haalt de app de referentie uit het modelbestand.
     """
     # Zoek het juiste tabblad (case-insensitief + synoniemen)
     sheet = find_answers_sheet(model_bytes)
@@ -157,17 +209,33 @@ def load_answers_df(model_bytes: io.BytesIO) -> pd.DataFrame:
     model_bytes.seek(0)
     df = pd.read_excel(model_bytes, sheet_name=sheet, engine="openpyxl")
 
-    # Normaliseer kolomnamen
+    # Normaliseer & map kolomnamen
+    df = _map_answers_columns(df)
+
+    # Normaliseer kolomnamen nogmaals naar lower/strip (verzekerd)
     df.columns = [str(c).strip().lower() for c in df.columns]
 
-    required = {"vraag_id", "sheet", "cel", "verwacht"}
-    missing = required - set(df.columns)
+    # Minimaal vereiste kolommen
+    required_min = {"vraag_id", "sheet", "cel"}
+    missing = required_min - set(df.columns)
     if missing:
+        found = ", ".join(df.columns)
         raise ValueError(
-            f"Tabblad '{sheet}' mist verplichte kolommen: {', '.join(sorted(missing))}"
+            "Het antwoordenblad mist verplichte kolommen: "
+            f"{', '.join(sorted(missing))}. Gevonden kolommen: {found}.
+"
+            "Accepteerde namen (synoniemen):
+"
+            "- vraag_id: vraag_id, vraag, id, vraagnummer, q, qid
+"
+            "- sheet: sheet, tabblad, blad, bladnaam, worksheet
+"
+            "- cel: cel, cell, celadres, cellref, address
+"
+            "- verwacht (optioneel): verwacht, expected, antwoord, key"
         )
 
-    # Optionele kolommen + defaults
+    # Zorg voor optionele kolommen met defaults
     if "type" not in df.columns:
         df["type"] = "auto"
     if "tolerance" not in df.columns:
